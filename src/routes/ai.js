@@ -1,10 +1,39 @@
 const { Router } = require("express");
 const auth = require("../middleware/auth");
+const { connectDB } = require("../db"); // adjust path to wherever this file lives
 
 const router = Router();
 
 const GEMINI_URL =
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent";
+
+// ─── Get the logged-in user's saved diet plan ──────────────────────────────
+router.get("/diet-plan", auth, async (req, res) => {
+    try {
+        const db = await connectDB();
+        const userId = req.user.id || req.user._id;
+
+        const doc = await db.collection("dietPlans").findOne({ user: String(userId) });
+        return res.json({ plan: doc ? doc.plan : null });
+    } catch (err) {
+        console.error("Failed to fetch diet plan:", err);
+        return res.status(500).json({ error: "Failed to fetch diet plan" });
+    }
+});
+
+// ─── Get the logged-in user's saved routines ───────────────────────────────
+router.get("/routines", auth, async (req, res) => {
+    try {
+        const db = await connectDB();
+        const userId = req.user.id || req.user._id;
+
+        const doc = await db.collection("routines").findOne({ user: String(userId) });
+        return res.json({ routines: doc ? doc.routines : null });
+    } catch (err) {
+        console.error("Failed to fetch routines:", err);
+        return res.status(500).json({ error: "Failed to fetch routines" });
+    }
+});
 
 router.post("/", auth, async (req, res, next) => {
     try {
@@ -19,12 +48,58 @@ router.post("/", auth, async (req, res, next) => {
             return await handleRegenerateQuestions(req, res, apiKey);
         }
 
+        if (action === "routine-questions") {
+            return await handleRoutineQuestions(req, res, apiKey);
+        }
+
+        if (action === "generate-routines") {
+            return await handleGenerateRoutines(req, res, apiKey);
+        }
+
+        if (action === "regenerate-routine-questions") {
+            return await handleRegenerateRoutineQuestions(req, res, apiKey);
+        }
+
         return res.status(400).json({ error: "Invalid action" });
     } catch (err) {
         console.error("AI Route error:", err);
         return res.json(getMockDietPlan(req.body.goal || "maintain"));
     }
 });
+
+// ─── Helper: persist a diet plan for the logged-in user ────────────────────
+async function saveDietPlan(user, plan) {
+    if (!user) return;
+    try {
+        const db = await connectDB();
+        const userId = user.id || user._id;
+
+        await db.collection("dietPlans").updateOne(
+            { user: String(userId) },
+            { $set: { plan, updatedAt: new Date() } },
+            { upsert: true }
+        );
+    } catch (err) {
+        console.error("Failed to save diet plan to MongoDB:", err);
+    }
+}
+
+// ─── Helper: persist routines for the logged-in user ───────────────────────
+async function saveRoutines(user, routines) {
+    if (!user) return;
+    try {
+        const db = await connectDB();
+        const userId = user.id || user._id;
+
+        await db.collection("routines").updateOne(
+            { user: String(userId) },
+            { $set: { routines, updatedAt: new Date() } },
+            { upsert: true }
+        );
+    } catch (err) {
+        console.error("Failed to save routines to MongoDB:", err);
+    }
+}
 
 // ─── Action: generate-diet ─────────────────────────────────────────────────
 async function handleGenerateDiet(req, res, apiKey) {
@@ -41,7 +116,9 @@ async function handleGenerateDiet(req, res, apiKey) {
 
     if (!apiKey) {
         console.warn("GEMINI_API_KEY not set — using offline mock mode.");
-        return res.json(getMockDietPlan(goal || "maintain"));
+        const mock = getMockDietPlan(goal || "maintain");
+        await saveDietPlan(req.user, mock);
+        return res.json(mock);
     }
 
     let prompt = `You are a professional dietitian and health planner.
@@ -53,9 +130,6 @@ Create a customized full-day eating plan for a user with these stats:
 - Fitness Goal: ${goal || "maintain"} (bulk, cut, or maintain)
 - Activity Level: ${activityLevel || "moderate"}`;
 
-    // If this is a regenerate request, feed in the previous plan and the
-    // user's answers so the AI adjusts the new plan instead of generating
-    // a random new one.
     if (previousPlan) {
         prompt += `\n\nThe user previously received this plan and wants a revised version:
 ${JSON.stringify(previousPlan)}`;
@@ -78,38 +152,26 @@ Also provide the total calculated daily calories, daily macronutrients (carbs, p
 Respond ONLY with a JSON object matching this schema. Do not output any backticks or markdown:
 {
   "meals": [
-    {
-      "name": "Breakfast",
-      "description": "Portion size, food details",
-      "calories": 450
-    }
+    { "name": "Breakfast", "description": "Portion size, food details", "calories": 450 }
   ],
   "totalCalories": 2000,
-  "macros": {
-    "carbs": 220,
-    "protein": 130,
-    "fat": 65
-  },
-  "dietitianTips": [
-    "Tip 1",
-    "Tip 2",
-    "Tip 3"
-  ]
+  "macros": { "carbs": 220, "protein": 130, "fat": 65 },
+  "dietitianTips": ["Tip 1", "Tip 2", "Tip 3"]
 }`;
 
     try {
         const plan = await callGemini(prompt, apiKey);
+        await saveDietPlan(req.user, plan);
         return res.json(plan);
     } catch (err) {
         console.error("Gemini generate-diet failed, falling back to mock:", err);
-        return res.json(getMockDietPlan(goal || "maintain"));
+        const mock = getMockDietPlan(goal || "maintain");
+        await saveDietPlan(req.user, mock);
+        return res.json(mock);
     }
 }
 
 // ─── Action: regenerate-diet-questions ─────────────────────────────────────
-// Asks the AI to come up with 1-2 short clarifying questions based on the
-// user's current plan and goal. Nothing here is hardcoded — the AI decides
-// what's worth asking.
 async function handleRegenerateQuestions(req, res, apiKey) {
     const { currentPlan, goal, activityLevel } = req.body;
 
@@ -124,20 +186,178 @@ ${JSON.stringify(currentPlan)}
 
 Their fitness goal is: ${goal || "maintain"}, activity level: ${activityLevel || "moderate"}.
 
-Come up with exactly 1 or 2 short, specific clarifying questions to ask the user before generating a revised plan (for example about taste preferences, meals that felt too heavy/light, ingredients to avoid, or variety). Keep each question under 15 words.
+Come up with exactly 1 or 2 short, specific clarifying questions to ask the user before generating a revised plan. Keep each question under 15 words.
 
 Respond ONLY with a JSON object matching this schema, no markdown or backticks:
-{
-  "questions": [
-    { "id": "q1", "question": "..." }
-  ]
-}`;
+{ "questions": [ { "id": "q1", "question": "..." } ] }`;
 
     try {
         const result = await callGemini(prompt, apiKey);
         return res.json(result);
     } catch (err) {
         console.error("Gemini regenerate-questions failed, skipping questions:", err);
+        return res.json({ questions: [] });
+    }
+}
+
+// ─── Action: routine-questions ─────────────────────────────────────────────
+// AI decides 3-5 personal, lifestyle-oriented questions (daily routine,
+// hobbies, hypothetical scenarios) to understand the user before building
+// a workout routine. Nothing here is hardcoded.
+async function handleRoutineQuestions(req, res, apiKey) {
+    const { goal, activityLevel, freeText } = req.body;
+
+    if (!apiKey) {
+        console.warn("GEMINI_API_KEY not set — skipping AI questions, going straight to routine generation.");
+        return res.json({ questions: [] });
+    }
+
+    const prompt = `You are an expert fitness coach and behavioral psychologist designing a personalized weekly workout routine.
+Before generating the routine, you want to understand the user as a person — not just their stats.
+
+User's fitness goal: ${goal || "general fitness"}
+Activity level: ${activityLevel || "moderate"}
+${freeText ? `The user already shared this about themselves: "${freeText}"` : ""}
+
+Come up with 3 to 5 short, thoughtful questions about their daily life, hobbies, personality, schedule, or even hypothetical scenarios (e.g. "if you had one free hour a day, what would you do with it?", "do you prefer competing against others or against yourself?") that would genuinely help you design a workout routine that fits who they are, not just their body stats. Keep each question under 18 words. Do not ask about height/weight/age — assume that data is already known.
+
+Respond ONLY with a JSON object matching this schema, no markdown or backticks:
+{ "questions": [ { "id": "q1", "question": "..." } ] }`;
+
+    try {
+        const result = await callGemini(prompt, apiKey);
+        return res.json(result);
+    } catch (err) {
+        console.error("Gemini routine-questions failed, skipping questions:", err);
+        return res.json({ questions: [] });
+    }
+}
+
+// ─── Action: generate-routines ─────────────────────────────────────────────
+// Generates 3 distinct recommended weekly workout routines based on the
+// user's stats, their answers to the AI-generated lifestyle questions, and
+// any free-text description of their condition/needs. Persists the result
+// to MongoDB so it's tied to the logged-in user, not the browser.
+async function handleGenerateRoutines(req, res, apiKey) {
+    const {
+        weight,
+        height,
+        age,
+        goal,
+        gender,
+        activityLevel,
+        answers,
+        freeText,
+        previousRoutines,
+        regenerateAnswers,
+    } = req.body;
+
+    if (!apiKey) {
+        console.warn("GEMINI_API_KEY not set — using offline mock mode.");
+        const mock = getMockRoutines(goal || "general fitness");
+        await saveRoutines(req.user, mock);
+        return res.json(mock);
+    }
+
+    let prompt = `You are an expert fitness coach with deep knowledge of established, evidence-based training methodologies (e.g. Push/Pull/Legs, Upper/Lower splits, Full Body 3x/week, 5x5 strength programs, HIIT circuits, hybrid conditioning programs, etc). You know which of these are considered the best and most effective for different goals, experience levels, and lifestyles.
+
+Design 3 distinct, complete weekly workout routines for this user. Base each routine on a real, well-regarded training methodology suited to their goal, activity level, and lifestyle — don't invent arbitrary exercise combinations. Select and adapt the methodology (exercise selection, volume, split structure, weekly frequency) specifically to fit this person's stats, schedule, hobbies, and stated needs, rather than giving a generic template.
+
+User stats:
+- Gender: ${gender || "unspecified"}
+- Weight: ${weight || 70} kg
+- Height: ${height || 170} cm
+- Age: ${age || 25} years old
+- Fitness Goal: ${goal || "general fitness"}
+- Activity Level: ${activityLevel || "moderate"}`;
+
+    if (answers && Object.keys(answers).length > 0) {
+        prompt += `\n\nHere is what the user shared about their lifestyle, hobbies, and personality (use this to make the routines feel personally tailored, e.g. matching their schedule, energy patterns, or interests):
+${Object.entries(answers)
+                .map(([id, answer]) => `- ${answer}`)
+                .join("\n")}`;
+    }
+
+    if (freeText) {
+        prompt += `\n\nThe user also described their condition and needs directly: "${freeText}"`;
+    }
+
+    if (previousRoutines) {
+        prompt += `\n\nThe user previously received these 3 routines and wants revised versions:
+${JSON.stringify(previousRoutines)}`;
+    }
+
+    if (regenerateAnswers && Object.keys(regenerateAnswers).length > 0) {
+        prompt += `\n\nThe user explained what they didn't like about the previous routines:
+${Object.entries(regenerateAnswers)
+                .map(([id, answer]) => `- ${answer}`)
+                .join("\n")}
+Use this feedback to meaningfully change the new routines — do not just repeat the previous ones.`;
+    }
+
+    prompt += `
+
+The 3 routines should represent genuinely different, well-established approaches (for example: one strength-focused split, one hybrid/conditioning style, one time-efficient or goal-specific approach) — each picked because it's a recognized effective methodology for this type of user, not just 3 random variations. Each routine should cover all 7 days of the week (use "Rest" for recovery days where appropriate) and include specific exercises with sets/reps or duration for each training day, following the set/rep ranges and structure that methodology is actually known for. Give each of the 3 routines a distinct name and short description that mentions the methodology it's based on and why it fits this user's life and goal.
+
+Respond ONLY with a JSON object matching this schema. Do not output any backticks or markdown:
+{
+  "routines": [
+    {
+      "name": "Routine name",
+      "description": "1-2 sentence description of this routine's style and who it's for",
+      "days": [
+        {
+          "day": "Monday",
+          "focus": "Upper Body Strength",
+          "exercises": [
+            { "name": "Push-ups", "sets": "3", "reps": "12-15" }
+          ]
+        }
+      ]
+    }
+  ]
+}
+For rest days, set "focus": "Rest" and "exercises": [].`;
+
+    try {
+        const result = await callGemini(prompt, apiKey);
+        await saveRoutines(req.user, result);
+        return res.json(result);
+    } catch (err) {
+        console.error("Gemini generate-routines failed, falling back to mock:", err);
+        const mock = getMockRoutines(goal || "general fitness");
+        await saveRoutines(req.user, mock);
+        return res.json(mock);
+    }
+}
+
+// ─── Action: regenerate-routine-questions ──────────────────────────────────
+// AI asks what the user didn't like about the previous 3 routines before
+// regenerating.
+async function handleRegenerateRoutineQuestions(req, res, apiKey) {
+    const { previousRoutines, goal } = req.body;
+
+    if (!apiKey) {
+        console.warn("GEMINI_API_KEY not set — skipping AI questions, going straight to regenerate.");
+        return res.json({ questions: [] });
+    }
+
+    const prompt = `You are a fitness coach following up with a user after giving them 3 weekly workout routines.
+Here are the routines they received:
+${JSON.stringify(previousRoutines)}
+
+Their fitness goal is: ${goal || "general fitness"}.
+
+Come up with exactly 1 or 2 short, specific questions to find out what they didn't like or want changed (for example: too many days, disliked certain exercises, wrong difficulty, no equipment access, etc). Keep each question under 15 words.
+
+Respond ONLY with a JSON object matching this schema, no markdown or backticks:
+{ "questions": [ { "id": "q1", "question": "..." } ] }`;
+
+    try {
+        const result = await callGemini(prompt, apiKey);
+        return res.json(result);
+    } catch (err) {
+        console.error("Gemini regenerate-routine-questions failed, skipping questions:", err);
         return res.json({ questions: [] });
     }
 }
@@ -151,7 +371,7 @@ async function callGemini(prompt, apiKey) {
             contents: [{ parts: [{ text: prompt }] }],
             generationConfig: {
                 responseMimeType: "application/json",
-                temperature: 0.3,
+                temperature: 0.4,
             },
         }),
     });
@@ -167,7 +387,7 @@ async function callGemini(prompt, apiKey) {
     return JSON.parse(text);
 }
 
-// ─── Mock fallback ──────────────────────────────────────────────────────────
+// ─── Mock fallback: diet ────────────────────────────────────────────────────
 function getMockDietPlan(goal) {
     if (goal === "cut") {
         return {
@@ -187,7 +407,6 @@ function getMockDietPlan(goal) {
             ]
         };
     }
-
     if (goal === "bulk") {
         return {
             meals: [
@@ -206,7 +425,6 @@ function getMockDietPlan(goal) {
             ]
         };
     }
-
     return {
         meals: [
             { name: "Breakfast", description: "2 Eggs, 2 slices of whole wheat toast, and 1 medium orange", calories: 380 },
@@ -221,6 +439,121 @@ function getMockDietPlan(goal) {
             "Keep meals balanced with equal ratios of complex carbohydrates, clean protein, and healthy fats.",
             "Adjust portion sizes slightly if you feel your daily energy levels dropping during training.",
             "Limit processed sugars and focus on whole foods for sustained energy."
+        ]
+    };
+}
+
+// ─── Mock fallback: workout routines ───────────────────────────────────────
+function getMockRoutines(goal) {
+    const restDay = { day: "Sunday", focus: "Rest", exercises: [] };
+
+    return {
+        routines: [
+            {
+                name: "Balanced Builder",
+                description: "A well-rounded routine mixing strength and cardio, good for steady overall progress.",
+                days: [
+                    {
+                        day: "Monday", focus: "Upper Body Strength", exercises: [
+                            { name: "Push-ups", sets: "3", reps: "12-15" },
+                            { name: "Dumbbell Rows", sets: "3", reps: "10-12" },
+                            { name: "Shoulder Press", sets: "3", reps: "10-12" }
+                        ]
+                    },
+                    {
+                        day: "Tuesday", focus: "Cardio", exercises: [
+                            { name: "Jogging", sets: "1", reps: "25 min" },
+                            { name: "Jump Rope", sets: "3", reps: "2 min" }
+                        ]
+                    },
+                    {
+                        day: "Wednesday", focus: "Lower Body Strength", exercises: [
+                            { name: "Bodyweight Squats", sets: "4", reps: "15" },
+                            { name: "Lunges", sets: "3", reps: "12 each leg" }
+                        ]
+                    },
+                    { day: "Thursday", focus: "Rest", exercises: [] },
+                    {
+                        day: "Friday", focus: "Full Body Circuit", exercises: [
+                            { name: "Burpees", sets: "3", reps: "10" },
+                            { name: "Mountain Climbers", sets: "3", reps: "20" },
+                            { name: "Plank", sets: "3", reps: "45 sec" }
+                        ]
+                    },
+                    {
+                        day: "Saturday", focus: "Light Cardio + Mobility", exercises: [
+                            { name: "Brisk Walk", sets: "1", reps: "30 min" },
+                            { name: "Stretching Routine", sets: "1", reps: "10 min" }
+                        ]
+                    },
+                    restDay
+                ]
+            },
+            {
+                name: "Time-Efficient Blast",
+                description: "Short, high-intensity sessions for people with a packed schedule.",
+                days: [
+                    {
+                        day: "Monday", focus: "HIIT Full Body", exercises: [
+                            { name: "Jump Squats", sets: "4", reps: "20" },
+                            { name: "Push-ups", sets: "4", reps: "15" }
+                        ]
+                    },
+                    { day: "Tuesday", focus: "Rest", exercises: [] },
+                    {
+                        day: "Wednesday", focus: "HIIT Full Body", exercises: [
+                            { name: "Kettlebell Swings", sets: "4", reps: "15" },
+                            { name: "Mountain Climbers", sets: "4", reps: "20" }
+                        ]
+                    },
+                    { day: "Thursday", focus: "Rest", exercises: [] },
+                    {
+                        day: "Friday", focus: "HIIT Full Body", exercises: [
+                            { name: "Burpees", sets: "4", reps: "12" },
+                            { name: "Plank to Push-up", sets: "3", reps: "10" }
+                        ]
+                    },
+                    {
+                        day: "Saturday", focus: "Active Recovery", exercises: [
+                            { name: "Light Walk", sets: "1", reps: "20 min" }
+                        ]
+                    },
+                    restDay
+                ]
+            },
+            {
+                name: "Strength Focus",
+                description: "Progressive strength training for building muscle and power over time.",
+                days: [
+                    {
+                        day: "Monday", focus: "Chest & Triceps", exercises: [
+                            { name: "Bench Press / Push-ups", sets: "4", reps: "8-10" },
+                            { name: "Tricep Dips", sets: "3", reps: "12" }
+                        ]
+                    },
+                    {
+                        day: "Tuesday", focus: "Back & Biceps", exercises: [
+                            { name: "Pull-ups / Assisted Pull-ups", sets: "4", reps: "6-8" },
+                            { name: "Dumbbell Curls", sets: "3", reps: "12" }
+                        ]
+                    },
+                    { day: "Wednesday", focus: "Rest", exercises: [] },
+                    {
+                        day: "Thursday", focus: "Legs", exercises: [
+                            { name: "Squats", sets: "4", reps: "10" },
+                            { name: "Romanian Deadlifts", sets: "3", reps: "10" }
+                        ]
+                    },
+                    {
+                        day: "Friday", focus: "Shoulders & Core", exercises: [
+                            { name: "Shoulder Press", sets: "4", reps: "10" },
+                            { name: "Hanging Leg Raises", sets: "3", reps: "12" }
+                        ]
+                    },
+                    { day: "Saturday", focus: "Rest", exercises: [] },
+                    restDay
+                ]
+            }
         ]
     };
 }
