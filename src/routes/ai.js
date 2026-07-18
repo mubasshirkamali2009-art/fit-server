@@ -1,6 +1,6 @@
 const { Router } = require("express");
 const auth = require("../middleware/auth");
-const { connectDB } = require("../db"); // adjust path to wherever this file lives
+const { connectDB } = require("../db");
 
 const router = Router();
 
@@ -13,7 +13,7 @@ router.get("/diet-plan", auth, async (req, res) => {
         const db = await connectDB();
         const userId = req.user.id || req.user._id;
 
-        const doc = await db.collection("dietPlans").findOne({ user: String(userId) });
+        const doc = await db.collection("dietPlans").findOne({ userId: String(userId) });
         return res.json({ plan: doc ? doc.plan : null });
     } catch (err) {
         console.error("Failed to fetch diet plan:", err);
@@ -27,7 +27,7 @@ router.get("/routines", auth, async (req, res) => {
         const db = await connectDB();
         const userId = req.user.id || req.user._id;
 
-        const doc = await db.collection("routines").findOne({ user: String(userId) });
+        const doc = await db.collection("routines").findOne({ userId: String(userId) });
         return res.json({ routines: doc ? doc.routines : null });
     } catch (err) {
         console.error("Failed to fetch routines:", err);
@@ -75,8 +75,8 @@ async function saveDietPlan(user, plan) {
         const userId = user.id || user._id;
 
         await db.collection("dietPlans").updateOne(
-            { user: String(userId) },
-            { $set: { plan, updatedAt: new Date() } },
+            { userId: String(userId) },
+            { $set: { plan, userId: String(userId), updatedAt: new Date() } },
             { upsert: true }
         );
     } catch (err) {
@@ -92,8 +92,8 @@ async function saveRoutines(user, routines) {
         const userId = user.id || user._id;
 
         await db.collection("routines").updateOne(
-            { user: String(userId) },
-            { $set: { routines, updatedAt: new Date() } },
+            { userId: String(userId) },
+            { $set: { routines, userId: String(userId), updatedAt: new Date() } },
             { upsert: true }
         );
     } catch (err) {
@@ -201,9 +201,6 @@ Respond ONLY with a JSON object matching this schema, no markdown or backticks:
 }
 
 // ─── Action: routine-questions ─────────────────────────────────────────────
-// AI decides 3-5 personal, lifestyle-oriented questions (daily routine,
-// hobbies, hypothetical scenarios) to understand the user before building
-// a workout routine. Nothing here is hardcoded.
 async function handleRoutineQuestions(req, res, apiKey) {
     const { goal, activityLevel, freeText } = req.body;
 
@@ -234,10 +231,6 @@ Respond ONLY with a JSON object matching this schema, no markdown or backticks:
 }
 
 // ─── Action: generate-routines ─────────────────────────────────────────────
-// Generates 3 distinct recommended weekly workout routines based on the
-// user's stats, their answers to the AI-generated lifestyle questions, and
-// any free-text description of their condition/needs. Persists the result
-// to MongoDB so it's tied to the logged-in user, not the browser.
 async function handleGenerateRoutines(req, res, apiKey) {
     const {
         weight,
@@ -332,8 +325,6 @@ For rest days, set "focus": "Rest" and "exercises": [].`;
 }
 
 // ─── Action: regenerate-routine-questions ──────────────────────────────────
-// AI asks what the user didn't like about the previous 3 routines before
-// regenerating.
 async function handleRegenerateRoutineQuestions(req, res, apiKey) {
     const { previousRoutines, goal } = req.body;
 
@@ -383,8 +374,30 @@ async function callGemini(prompt, apiKey) {
     }
 
     const json = await response.json();
-    const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
-    return JSON.parse(text);
+    let text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!text) {
+        throw new Error("Empty response received from Gemini");
+    }
+
+    // Clean markdown wraps if the model added them despite instructions
+    text = text.replace(/^```json\s*/i, "").replace(/```\s*$/, "").trim();
+
+    try {
+        return JSON.parse(text);
+    } catch (parseError) {
+        console.warn("Direct JSON parsing failed, executing format cleanup...", parseError);
+        try {
+            // strip destructive line breaks or unescaped control markers
+            const cleanedText = text
+                .replace(/[\u0000-\u001F\u007F-\u009F]/g, "")
+                .replace(/,\s*([\]}])/g, "$1");
+            return JSON.parse(cleanedText);
+        } catch (fallbackError) {
+            console.error("Raw failed payload:\n", text);
+            throw fallbackError;
+        }
+    }
 }
 
 // ─── Mock fallback: diet ────────────────────────────────────────────────────
