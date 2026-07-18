@@ -39,6 +39,10 @@ app.use("/api/ai", aiRouter);
 app.use(errorHandler);
 
 // ─── Start ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🚀 FitTracker API running on http://localhost:${PORT}`);
-});
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => {
+    console.log(`🚀 FitTracker API running on http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
