@@ -6,6 +6,7 @@ const usersRouter = require("./src/routes/users");
 const profileRouter = require("./src/routes/profile");
 const nutritionRouter = require("./src/routes/nutrition");
 const aiRouter = require("./src/routes/ai");
+const routinesRouter = require("./src/routes/routines"); // ← add this
 const errorHandler = require("./src/middleware/errorHandler");
 
 const app = express();
@@ -14,14 +15,13 @@ const PORT = process.env.PORT || 5000;
 // ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
+    origin: process.env.CLIENT_URL,
     credentials: true,
   })
 );
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// Serve uploaded files (progress photos stored on disk)
 app.use("/uploads", express.static("uploads"));
 
 // ─── Health Check ─────────────────────────────────────────────────────────────
@@ -34,6 +34,7 @@ app.use("/api/users", usersRouter);
 app.use("/api/profile", profileRouter);
 app.use("/api/nutrition", nutritionRouter);
 app.use("/api/ai", aiRouter);
+app.use("/api/routines", routinesRouter); // ← add this
 
 // ─── Global Error Handler ─────────────────────────────────────────────────────
 app.use(errorHandler);
